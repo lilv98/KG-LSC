@@ -5,6 +5,15 @@ import argparse
 import numpy as np
 import random
 import os
+import pickle
+
+def save_obj(obj, path):
+    with open(path, 'wb') as f:
+        pickle.dump(obj, f, pickle.HIGHEST_PROTOCOL)
+
+def load_obj(path):
+    with open(path, 'rb') as f:
+        return pickle.load(f)
 
 def seed_everything(seed: int):
     random.seed(seed)
@@ -15,19 +24,24 @@ def seed_everything(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
 
-def get_words():
-    words = set()
-    with open('./ccoha1.txt') as f:
-        for line in f:
-            line = line.strip().split(' ')
-            for i in range(len(line)):
-                words.add(line[i])
-    with open('./ccoha2.txt') as f:
-        for line in f:
-            line = line.strip().split(' ')
-            for i in range(len(line)):
-                words.add(line[i])
-    return {v: k for k, v in enumerate(words)}
+def get_words(cfg):
+    if os.path.exists(cfg.save_root + '/e_dict.pkl'):
+        e_dict = load_obj(cfg.save_root + '/e_dict.pkl')
+    else:
+        words = set()
+        with open('./ccoha1.txt') as f:
+            for line in f:
+                line = line.strip().split(' ')
+                for i in range(len(line)):
+                    words.add(line[i])
+        with open('./ccoha2.txt') as f:
+            for line in f:
+                line = line.strip().split(' ')
+                for i in range(len(line)):
+                    words.add(line[i])
+        e_dict = {v: k for k, v in enumerate(words)}
+        save_obj(e_dict, cfg.save_root + '/e_dict.pkl')
+    return e_dict
 
 def get_cooccur(words, id):
     triples = {}
@@ -107,6 +121,53 @@ class KnowledgeGraphEmbeddingModel(torch.nn.Module):
         weights = (freq / freq.sum()).unsqueeze(dim=-1)
         return (pointwise * weights).sum() / pointwise.size(dim=-1)
 
+def get_test_data():
+    ret = []
+    with open('./binary.txt') as f:
+        for line in f:
+            line = line.strip().split('\t')
+            ret.append([line[0], int(line[1])])
+
+    with open('./graded.txt') as f:
+        counter = 0
+        for line in f:
+            line = line.strip().split('\t')
+            ret[counter].append(float(line[1]))
+            counter += 1
+    
+    return ret
+
+def js_div(fs_1, fs_2):
+    fs_1_normalized = torch.nn.functional.normalize(fs_1, p=1, dim=-1)
+    fs_2_normalized = torch.nn.functional.normalize(fs_2, p=1, dim=-1)
+    M = 0.5 * (fs_1_normalized + fs_2_normalized)
+    kl_1 = torch.nn.functional.kl_div(torch.log(fs_1_normalized + 1e-10), M, reduction='none', log_target=False).sum(dim=-1)
+    kl_2 = torch.nn.functional.kl_div(torch.log(fs_2_normalized + 1e-10), M, reduction='none', log_target=False).sum(dim=-1)
+    return 0.5 * (kl_1 + kl_2)
+
+def evaluate(e_dict, r_dict, cfg):
+    model_1 = KnowledgeGraphEmbeddingModel(e_dict, r_dict, cfg)
+    model_2 = KnowledgeGraphEmbeddingModel(e_dict, r_dict, cfg)
+    model_1.load_state_dict(torch.load(cfg.save_root + 'corpus_1_' + str(cfg.epochs_respective) + '.pt'))
+    model_2.load_state_dict(torch.load(cfg.save_root + 'corpus_2_' + str(cfg.epochs_respective) + '.pt'))
+    model_1.eval()
+    model_2.eval()
+    test_data = get_test_data()
+    
+    cossim = torch.nn.CosineSimilarity()
+    results = []
+    for entry in test_data:
+        id = e_dict[entry[0]]
+        emb_1 = model_1.e_embedding.weight[id]
+        emb_2 = model_2.e_embedding.weight[id]
+        pred = torch.sigmoid(cossim(emb_1.unsqueeze(dim=0), emb_2.unsqueeze(dim=0)))
+        results.append([pred, entry[1], entry[2]])
+    results = torch.tensor(results)
+    binary_result = ((results[:, 0] > 0.5) == results[:, 1]).sum() / len(results)
+    print(f'Task 1: {round(binary_result.item(), 3)}')
+    graded_result = js_div(results[:, 0], results[:, -1])
+    print(f'Task 2: {round(graded_result.item(), 3)}')
+
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
     # Tunable
@@ -119,11 +180,12 @@ def parse_args(args=None):
     parser.add_argument('--do', default=0.2, type=float)
     parser.add_argument('--scoring_fct_norm', default=2, type=int)
     # Untunable
-    parser.add_argument('--num_workers', default=8, type=int)
-    parser.add_argument('--epochs_common', default=3, type=int)
-    parser.add_argument('--epochs_respective', default=3, type=int)
+    parser.add_argument('--num_workers', default=4, type=int)
+    parser.add_argument('--epochs_common', default=100, type=int)
+    parser.add_argument('--epochs_respective', default=20, type=int)
     parser.add_argument('--gpu', default=0, type=int)
     parser.add_argument('--seed', default=42, type=int)
+    parser.add_argument('--save_root', default='./', type=str)
     return parser.parse_args(args)
 
 if __name__ == '__main__':
@@ -135,8 +197,7 @@ if __name__ == '__main__':
     seed_everything(cfg.seed)
     device = torch.device(f'cuda:{cfg.gpu}' if torch.cuda.is_available() else 'cpu')
     
-    save_root = './'
-    e_dict = get_words()
+    e_dict = get_words(cfg)
     r_dict = {'cooccur': 0}
     triples_1, data_1 = get_cooccur(e_dict, id=1)
     triples_2, data_2 = get_cooccur(e_dict, id=2)
@@ -177,11 +238,11 @@ if __name__ == '__main__':
             optimizer_common.step()
             avg_loss.append(loss.item())
         print(f'Loss: {round(sum(avg_loss) / len(avg_loss), 6)}')
-    torch.save(model.state_dict(), save_root + 'common_' + str(cfg.epochs_common) + '.pt')
+    torch.save(model.state_dict(), cfg.save_root + 'common_' + str(cfg.epochs_common) + '.pt')
     
     model_1 = KnowledgeGraphEmbeddingModel(e_dict, r_dict, cfg)
     model_1 = model_1.to(device)
-    model_1.load_state_dict(torch.load(save_root + 'common_' + str(cfg.epochs_common) + '.pt'))
+    model_1.load_state_dict(torch.load(cfg.save_root + 'common_' + str(cfg.epochs_common) + '.pt'))
     optimizer_1 = torch.optim.Adam(model_1.parameters(), lr=cfg.lr, weight_decay=cfg.wd)
     for epoch in range(cfg.epochs_respective):
         print(f'Corpus 1 -- Epoch {epoch + 1}:')
@@ -195,11 +256,11 @@ if __name__ == '__main__':
             optimizer_1.step()
             avg_loss.append(loss.item())
         print(f'Loss: {round(sum(avg_loss) / len(avg_loss), 6)}')
-    torch.save(model_1.state_dict(), save_root + 'corpus_1_' + str(cfg.epochs_respective) + '.pt')
+    torch.save(model_1.state_dict(), cfg.save_root + 'corpus_1_' + str(cfg.epochs_respective) + '.pt')
     
     model_2 = KnowledgeGraphEmbeddingModel(e_dict, r_dict, cfg)
     model_2 = model_2.to(device)
-    model_2.load_state_dict(torch.load(save_root + 'common_' + str(cfg.epochs_common) + '.pt'))
+    model_2.load_state_dict(torch.load(cfg.save_root + 'common_' + str(cfg.epochs_common) + '.pt'))
     optimizer_2 = torch.optim.Adam(model_2.parameters(), lr=cfg.lr, weight_decay=cfg.wd)
     for epoch in range(cfg.epochs_respective):
         print(f'Corpus 2 -- Epoch {epoch + 1}:')
@@ -213,9 +274,7 @@ if __name__ == '__main__':
             optimizer_2.step()
             avg_loss.append(loss.item())
         print(f'Loss: {round(sum(avg_loss) / len(avg_loss), 6)}')
-    torch.save(model_2.state_dict(), save_root + 'corpus_2_' + str(cfg.epochs_respective) + '.pt')
+    torch.save(model_2.state_dict(), cfg.save_root + 'corpus_2_' + str(cfg.epochs_respective) + '.pt')
     
-    model_1.load_state_dict(torch.load(save_root + 'corpus_1_' + str(cfg.epochs_respective) + '.pt'))
-    model_2.load_state_dict(torch.load(save_root + 'corpus_2_' + str(cfg.epochs_respective) + '.pt'))
-    
+    evaluate(e_dict, r_dict, cfg)
     
